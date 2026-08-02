@@ -137,24 +137,49 @@ public final class SocketBridge: @unchecked Sendable {
         defer { close(fd) }
         var buffer = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
-        // Read until newline or peer close (single NDJSON line expected; multi-line OK).
+        // Read until peer closes (EOF). Cursor (and batch senders) may put multiple
+        // NDJSON lines on one connection — often as one write, sometimes split
+        // across reads. Breaking on the first newline drops every later line.
         while true {
             let n = read(fd, &tmp, tmp.count)
             if n < 0 {
                 if errno == EINTR { continue }
-                return
+                break
             }
-            if n == 0 { break }
+            if n == 0 {
+                // EOF: flush any remaining complete lines (and a final line without \n).
+                flushCompleteLines(from: &buffer, clientFD: fd, includeTrailingPartial: true)
+                break
+            }
             buffer.append(tmp, count: n)
-            if buffer.contains(UInt8(ascii: "\n")) { break }
-            // Cap message size
             if buffer.count > 1_000_000 { return }
+            flushCompleteLines(from: &buffer, clientFD: fd, includeTrailingPartial: false)
         }
+    }
 
-        let text = String(data: buffer, encoding: .utf8) ?? ""
-        let lines = text.split(whereSeparator: \.isNewline).map(String.init).filter { !$0.isEmpty }
-        for line in lines {
-            handleLine(line, clientFD: fd)
+    /// Drain complete `\n`-terminated NDJSON lines from `buffer` and handle each.
+    /// When `includeTrailingPartial` is true (EOF), also handle a final non-empty remnant.
+    private func flushCompleteLines(from buffer: inout Data, clientFD: Int32, includeTrailingPartial: Bool) {
+        while true {
+            guard let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) else { break }
+            let lineData = buffer.subdata(in: buffer.startIndex..<nl)
+            let next = buffer.index(after: nl)
+            buffer.removeSubrange(buffer.startIndex..<next)
+            if let line = String(data: lineData, encoding: .utf8) {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    handleLine(trimmed, clientFD: clientFD)
+                }
+            }
+        }
+        if includeTrailingPartial, !buffer.isEmpty {
+            if let line = String(data: buffer, encoding: .utf8) {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    handleLine(trimmed, clientFD: clientFD)
+                }
+            }
+            buffer.removeAll(keepingCapacity: false)
         }
     }
 

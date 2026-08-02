@@ -174,12 +174,93 @@ enum SocketSelfTest {
             check("cursor gate fail-open empty or passthrough", true)
         }
 
+        // 8) Multi-line same connection (Cursor bridge batches pending + activity).
+        // Write line A, sleep so a buggy server would close after first \n, then line B.
+        let multiOK = sendMultiLineSameConnection(
+            sock: sock,
+            lines: [
+                #"{"v":1,"source":"cursor","session_id":"sess-multi","action":"pending","command":"rm -rf /tmp/x","cwd":"/Users/demo/multi"}"#,
+                #"{"v":1,"source":"cursor","session_id":"sess-multi","action":"activity","status":"shell","title":"Running: rm -rf /tmp/x"}"#
+            ],
+            interLineSleep: 0.15
+        )
+        check("multi-line same connection send OK", multiOK)
+        Thread.sleep(forTimeInterval: 0.1)
+        let multi = store.session(id: "sess-multi")
+        check("multi-line first msg applied (pending/needs-you)", multi?.attention == .needsYou, multi.map { $0.attention.badge } ?? "nil")
+        check("multi-line second msg applied (activity title)", multi?.activityTitle == "Running: rm -rf /tmp/x", multi?.activityTitle ?? "nil")
+        check("multi-line session present after split writes", multi != nil)
+
+        // 9) Multi-line batch write (single sendall of two lines) — Cursor shape.
+        let batchPayload = [
+            #"{"v":1,"source":"cursor","session_id":"sess-batch","action":"pending","command":"git push","cwd":"/Users/demo/batch"}"#,
+            #"{"v":1,"source":"cursor","session_id":"sess-batch","action":"activity","status":"shell","title":"Running: git push"}"#
+        ].map { $0.hasSuffix("\n") ? $0 : $0 + "\n" }.joined()
+        let batchOK = sendRaw(sock: sock, payload: batchPayload, closeAfter: true)
+        check("multi-line batch sendall OK", batchOK)
+        Thread.sleep(forTimeInterval: 0.1)
+        let batch = store.session(id: "sess-batch")
+        check("batch first+second applied", batch?.attention == .needsYou && batch?.activityTitle == "Running: git push",
+              batch.map { "\($0.attention.badge)/\($0.activityTitle ?? "")" } ?? "nil")
+
         if failures == 0 {
             print("SOCKET SELFTEST OK")
             return 0
         }
         print("SOCKET SELFTEST FAILURES=\(failures)")
         return 1
+    }
+
+    /// Cursor-style: one AF_UNIX connection, write line A, pause, write line B, then close.
+    /// A server that stops reading after the first newline will drop B (BrokenPipe / never apply).
+    private static func sendMultiLineSameConnection(sock: String, lines: [String], interLineSleep: TimeInterval) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        guard connectUnix(fd: fd, path: sock) else { return false }
+        for (i, line) in lines.enumerated() {
+            var payload = line
+            if !payload.hasSuffix("\n") { payload += "\n" }
+            let data = payload.data(using: .utf8)!
+            let wrote = data.withUnsafeBytes { raw -> Int in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
+                return write(fd, base, data.count)
+            }
+            if wrote < 0 { return false }
+            if i + 1 < lines.count {
+                Thread.sleep(forTimeInterval: interLineSleep)
+            }
+        }
+        return true
+    }
+
+    private static func sendRaw(sock: String, payload: String, closeAfter: Bool) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { if closeAfter { close(fd) } else { close(fd) } }
+        guard connectUnix(fd: fd, path: sock) else { return false }
+        let data = payload.data(using: .utf8)!
+        let wrote = data.withUnsafeBytes { raw -> Int in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
+            return write(fd, base, data.count)
+        }
+        return wrote >= 0
+    }
+
+    private static func connectUnix(fd: Int32, path: String) -> Bool {
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = path.utf8CString
+        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return false }
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { cptr in
+                for (i, b) in pathBytes.enumerated() { cptr[i] = b }
+            }
+        }
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        return withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
+        } == 0
     }
 
     private static func sendFireAndForget(sock: String, json: String) {
@@ -190,20 +271,7 @@ enum SocketSelfTest {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = sock.utf8CString
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { cptr in
-                for (i, b) in pathBytes.enumerated() { cptr[i] = b }
-            }
-        }
-        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let ok = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
-        }
-        guard ok == 0 else { return nil }
+        guard connectUnix(fd: fd, path: sock) else { return nil }
 
         var payload = json
         if !payload.hasSuffix("\n") { payload += "\n" }
