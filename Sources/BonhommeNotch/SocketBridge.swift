@@ -11,10 +11,14 @@ public final class SocketBridge: @unchecked Sendable {
 
     private var listenFD: Int32 = -1
     private var acceptQueue: DispatchQueue?
-    private var isRunning = false
+    private let runLock = NSLock()
+    private var _isRunning = false
     private let gateLock = NSLock()
-    /// sessionID → waiter for blocking gate.
+    /// Composite `source:sessionID` → waiter for blocking gate.
     private var gateWaiters: [String: GateWaiter] = [:]
+
+    private let ioQueue = DispatchQueue(label: "app.bonhommenotch.socket.io")
+    private var statusFlushItem: DispatchWorkItem?
 
     public init(store: SessionStore, socketPath: String? = nil, statusPath: String? = nil) {
         self.store = store
@@ -69,43 +73,100 @@ public final class SocketBridge: @unchecked Sendable {
             listenFD = -1
         }
         try? FileManager.default.removeItem(atPath: socketPath)
+        ioQueue.sync {
+            statusFlushItem?.cancel()
+            statusFlushItem = nil
+        }
+        try? FileManager.default.removeItem(atPath: statusPath)
         gateLock.lock()
         for (_, w) in gateWaiters {
             w.failOpen()
         }
         gateWaiters.removeAll()
         gateLock.unlock()
+        // Unblocked waiters may still sendAll() on client fds that are already
+        // closing at termination; sendAll treats EPIPE as failure and returns.
     }
 
     /// Approve a waiting gate (Claude/Codex). Returns false if none waiting.
     @discardableResult
     public func approve(sessionID: String) -> Bool {
         gateLock.lock()
-        defer { gateLock.unlock() }
-        guard let waiter = gateWaiters[sessionID] else { return false }
-        let input = store.session(id: sessionID)?.gateToolInput
+        guard let found = findWaiter(for: sessionID) else {
+            gateLock.unlock()
+            return false
+        }
+        let waiter = found.waiter
+        let input = store.session(source: waiter.source, sessionID: waiter.sessionID)?.gateToolInput
         let decision = GateDecisionBuilder.allow(source: waiter.source, toolInput: input)
         waiter.complete(decision)
-        gateWaiters.removeValue(forKey: sessionID)
-        store.resolveGate(sessionID: sessionID)
-        writeStatus()
+        gateWaiters.removeValue(forKey: found.key)
+        let source = waiter.source
+        let sid = waiter.sessionID
+        gateLock.unlock()
+
+        store.resolveGate(source: source, sessionID: sid)
+        scheduleWriteStatus()
         return true
     }
 
     @discardableResult
     public func deny(sessionID: String, message: String = "Denied from BonhommeNotch") -> Bool {
         gateLock.lock()
-        defer { gateLock.unlock() }
-        guard let waiter = gateWaiters[sessionID] else { return false }
+        guard let found = findWaiter(for: sessionID) else {
+            gateLock.unlock()
+            return false
+        }
+        let waiter = found.waiter
         let decision = GateDecisionBuilder.deny(source: waiter.source, message: message)
         waiter.complete(decision)
-        gateWaiters.removeValue(forKey: sessionID)
-        store.resolveGate(sessionID: sessionID)
-        writeStatus()
+        gateWaiters.removeValue(forKey: found.key)
+        let source = waiter.source
+        let sid = waiter.sessionID
+        gateLock.unlock()
+
+        store.resolveGate(source: source, sessionID: sid)
+        scheduleWriteStatus()
         return true
     }
 
+    /// Immediate status write (cancels a pending debounce). Used by `--status` observers and tests.
     public func writeStatus() {
+        ioQueue.sync {
+            statusFlushItem?.cancel()
+            statusFlushItem = nil
+            writeStatusNow()
+        }
+    }
+
+    private var isRunning: Bool {
+        get {
+            runLock.lock()
+            defer { runLock.unlock() }
+            return _isRunning
+        }
+        set {
+            runLock.lock()
+            _isRunning = newValue
+            runLock.unlock()
+        }
+    }
+
+    private func scheduleWriteStatus() {
+        ioQueue.async { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.statusFlushItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                self?.writeStatusNow()
+            }
+            self.statusFlushItem = item
+            self.ioQueue.asyncAfter(deadline: .now() + .milliseconds(250), execute: item)
+        }
+    }
+
+    /// Must run on `ioQueue`.
+    private func writeStatusNow() {
+        guard isRunning else { return }
         let snap = StatusSnapshot.from(store: store)
         try? snap.write(to: statusPath)
     }
@@ -117,6 +178,15 @@ public final class SocketBridge: @unchecked Sendable {
         if fm.fileExists(atPath: socketPath) {
             try fm.removeItem(atPath: socketPath)
         }
+    }
+
+    private func findWaiter(for sessionID: String) -> (key: String, waiter: GateWaiter)? {
+        if let w = gateWaiters[sessionID] {
+            return (sessionID, w)
+        }
+        let matches = gateWaiters.filter { $0.value.sessionID == sessionID }
+        guard matches.count == 1, let only = matches.first else { return nil }
+        return (only.key, only.value)
     }
 
     private func acceptLoop() {
@@ -148,47 +218,66 @@ public final class SocketBridge: @unchecked Sendable {
             }
             if n == 0 {
                 // EOF: flush any remaining complete lines (and a final line without \n).
-                flushCompleteLines(from: &buffer, clientFD: fd, includeTrailingPartial: true)
+                _ = flushCompleteLines(from: &buffer, clientFD: fd, includeTrailingPartial: true)
                 break
             }
             buffer.append(tmp, count: n)
             if buffer.count > 1_000_000 { return }
-            flushCompleteLines(from: &buffer, clientFD: fd, includeTrailingPartial: false)
+            if flushCompleteLines(from: &buffer, clientFD: fd, includeTrailingPartial: false) {
+                return
+            }
         }
     }
 
     /// Drain complete `\n`-terminated NDJSON lines from `buffer` and handle each.
     /// When `includeTrailingPartial` is true (EOF), also handle a final non-empty remnant.
-    private func flushCompleteLines(from buffer: inout Data, clientFD: Int32, includeTrailingPartial: Bool) {
-        while true {
-            guard let nl = buffer.firstIndex(of: UInt8(ascii: "\n")) else { break }
-            let lineData = buffer.subdata(in: buffer.startIndex..<nl)
-            let next = buffer.index(after: nl)
-            buffer.removeSubrange(buffer.startIndex..<next)
-            if let line = String(data: lineData, encoding: .utf8) {
+    /// Returns true if the caller should close the client (timeout fail-open).
+    @discardableResult
+    private func flushCompleteLines(from buffer: inout Data, clientFD: Int32, includeTrailingPartial: Bool) -> Bool {
+        var start = buffer.startIndex
+        while start < buffer.endIndex {
+            let region = buffer[start..<buffer.endIndex]
+            guard let nl = region.firstIndex(of: UInt8(ascii: "\n")) else { break }
+            let lineData = buffer[start..<nl]
+            start = buffer.index(after: nl)
+            if let line = String(data: Data(lineData), encoding: .utf8) {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty {
-                    handleLine(trimmed, clientFD: clientFD)
+                    if handleLine(trimmed, clientFD: clientFD) {
+                        if start > buffer.startIndex {
+                            buffer.removeSubrange(buffer.startIndex..<start)
+                        }
+                        return true
+                    }
                 }
             }
+        }
+        if start > buffer.startIndex {
+            buffer.removeSubrange(buffer.startIndex..<start)
         }
         if includeTrailingPartial, !buffer.isEmpty {
             if let line = String(data: buffer, encoding: .utf8) {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty {
-                    handleLine(trimmed, clientFD: clientFD)
+                    if handleLine(trimmed, clientFD: clientFD) {
+                        buffer.removeAll(keepingCapacity: true)
+                        return true
+                    }
                 }
             }
-            buffer.removeAll(keepingCapacity: false)
+            buffer.removeAll(keepingCapacity: true)
         }
+        return false
     }
 
-    private func handleLine(_ line: String, clientFD: Int32) {
+    /// Returns true if the client connection should close (timeout fail-open).
+    @discardableResult
+    private func handleLine(_ line: String, clientFD: Int32) -> Bool {
         let message: HookMessage
         do {
             message = try HookProtocol.parse(line)
         } catch {
-            return
+            return false
         }
 
         // Cursor-class must never block the editor: convert gate → pending + passthrough.
@@ -204,70 +293,70 @@ public final class SocketBridge: @unchecked Sendable {
                 command: message.detail
             )
             store.apply(pending)
-            writeStatus()
+            scheduleWriteStatus()
             let passthrough = GateDecision(behavior: .passthrough)
             if let data = try? (passthrough.socketJSONLine() + "\n").data(using: .utf8) {
-                data.withUnsafeBytes { raw in
-                    if let base = raw.bindMemory(to: UInt8.self).baseAddress {
-                        _ = write(clientFD, base, data.count)
-                    }
-                }
+                _ = SocketIO.sendAll(fd: clientFD, data: data)
             }
-            return
+            return false
         }
 
         if message.action == .gate {
             store.apply(message)
-            writeStatus()
-            let waiter = GateWaiter(source: message.source, timeout: defaultGateTimeout)
+            scheduleWriteStatus()
+            let waiter = GateWaiter(
+                source: message.source,
+                sessionID: message.sessionID,
+                timeout: defaultGateTimeout
+            )
+            let key = AgentSession.storeKey(source: message.source, sessionID: message.sessionID)
             gateLock.lock()
-            gateWaiters[message.sessionID] = waiter
+            gateWaiters[key] = waiter
             gateLock.unlock()
 
             // Block this connection until approve/deny or timeout (fail-open).
             let decision = waiter.wait()
             gateLock.lock()
-            gateWaiters.removeValue(forKey: message.sessionID)
+            gateWaiters.removeValue(forKey: key)
             gateLock.unlock()
 
-            if decision.behavior == .passthrough || decision.behavior == .allow || decision.behavior == .deny {
-                if decision.behavior != .passthrough {
-                    store.resolveGate(sessionID: message.sessionID)
-                } else {
-                    // timeout: leave needs-you so UI can still show, but clear waiter
-                    store.resolveGate(sessionID: message.sessionID)
-                }
-            }
-            writeStatus()
-
-            // Fail-open: on timeout, write nothing so hook falls through to terminal.
             if decision.behavior == .passthrough {
-                return
+                // Timeout: leave needs-you so the HUD still shows the pending
+                // decision after the agent falls through to its own prompt.
+                // Close the client so the hook's recv returns empty immediately
+                // instead of sitting on the 1795s socket timeout.
+                store.releaseGateWaiter(source: message.source, sessionID: message.sessionID)
+                scheduleWriteStatus()
+                return true
             }
+            if decision.behavior == .allow || decision.behavior == .deny {
+                store.resolveGate(source: message.source, sessionID: message.sessionID)
+            }
+            scheduleWriteStatus()
+
             if let data = try? (decision.socketJSONLine() + "\n").data(using: .utf8) {
-                data.withUnsafeBytes { raw in
-                    if let base = raw.bindMemory(to: UInt8.self).baseAddress {
-                        _ = write(clientFD, base, data.count)
-                    }
-                }
+                _ = SocketIO.sendAll(fd: clientFD, data: data)
             }
-            return
+            return false
         }
 
         store.apply(message)
-        writeStatus()
+        scheduleWriteStatus()
+        return false
     }
 }
 
 private final class GateWaiter: @unchecked Sendable {
     let source: AgentSource
+    let sessionID: String
     let timeout: TimeInterval
     private let semaphore = DispatchSemaphore(value: 0)
     private var decision: GateDecision?
     private let lock = NSLock()
 
-    init(source: AgentSource, timeout: TimeInterval) {
+    init(source: AgentSource, sessionID: String, timeout: TimeInterval) {
         self.source = source
+        self.sessionID = sessionID
         self.timeout = timeout
     }
 
@@ -288,6 +377,28 @@ private final class GateWaiter: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return decision ?? GateDecision(behavior: .passthrough)
+    }
+}
+
+enum SocketIO {
+    /// Loop until every byte is written. A single `write()` can truncate past PIPE_BUF.
+    @discardableResult
+    static func sendAll(fd: Int32, data: Data) -> Bool {
+        if data.isEmpty { return true }
+        return data.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            var sent = 0
+            while sent < data.count {
+                let n = write(fd, base.advanced(by: sent), data.count - sent)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                if n == 0 { return false }
+                sent += n
+            }
+            return true
+        }
     }
 }
 

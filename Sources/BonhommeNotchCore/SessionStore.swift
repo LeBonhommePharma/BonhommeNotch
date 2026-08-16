@@ -29,7 +29,8 @@ public enum NeedsYouKind: String, Sendable, Codable, Equatable {
 }
 
 public struct AgentSession: Equatable, Identifiable {
-    public var id: String { sessionID }
+    /// Composite `source:sessionID` — session ids are not unique across agents.
+    public var id: String { Self.storeKey(source: source, sessionID: sessionID) }
     public var sessionID: String
     public var source: AgentSource
     public var attention: SessionAttention
@@ -78,11 +79,15 @@ public struct AgentSession: Equatable, Identifiable {
         self.options = options
     }
 
+    public static func storeKey(source: AgentSource, sessionID: String) -> String {
+        "\(source.rawValue):\(sessionID)"
+    }
+
     public var focusLine: String {
         let name = projectName
         let badge = attention.badge
         if let detail, !detail.isEmpty {
-            let clipped = detail.count > 80 ? String(detail.prefix(77)) + "…" : detail
+            let clipped = detail.count > 80 ? String(detail.prefix(79)) + "…" : detail
             return "\(source.rawValue) · \(name) · \(badge) · \(clipped)"
         }
         if let activityTitle, !activityTitle.isEmpty {
@@ -135,9 +140,17 @@ public final class SessionStore: @unchecked Sendable {
         return Array(sessions.values)
     }
 
+    public func session(source: AgentSource, sessionID: String) -> AgentSession? {
+        lock.lock(); defer { lock.unlock() }
+        return sessions[AgentSession.storeKey(source: source, sessionID: sessionID)]
+    }
+
+    /// Lookup by composite `id`, or by raw `sessionID` when that id is unique.
     public func session(id: String) -> AgentSession? {
         lock.lock(); defer { lock.unlock() }
-        return sessions[id]
+        if let s = sessions[id] { return s }
+        let matches = sessions.values.filter { $0.sessionID == id }
+        return matches.count == 1 ? matches.first : nil
     }
 
     /// Ranked: needs-you first, then working, finished, idle; within tier by lastUpdated desc.
@@ -156,16 +169,22 @@ public final class SessionStore: @unchecked Sendable {
     }
 
     public var primaryFocusLine: String {
-        guard let p = primaryFocus else { return "BonhommeNotch · idle" }
-        return p.focusLine
+        focusLine(ranked: ranked())
+    }
+
+    public func focusLine(ranked sessions: [AgentSession]) -> String {
+        sessions.first?.focusLine ?? "BonhommeNotch · idle"
     }
 
     public var statusSummary: String {
-        let r = ranked()
-        if r.isEmpty { return "0 sessions" }
-        let needs = r.filter { $0.attention == .needsYou }.count
-        let working = r.filter { $0.attention == .working }.count
-        return "\(r.count) sessions · \(needs) needs you · \(working) working · focus: \(primaryFocusLine)"
+        statusSummary(ranked: ranked())
+    }
+
+    public func statusSummary(ranked sessions: [AgentSession]) -> String {
+        if sessions.isEmpty { return "0 sessions" }
+        let needs = sessions.filter { $0.attention == .needsYou }.count
+        let working = sessions.filter { $0.attention == .working }.count
+        return "\(sessions.count) sessions · \(needs) needs you · \(working) working · focus: \(focusLine(ranked: sessions))"
     }
 
     @discardableResult
@@ -176,7 +195,8 @@ public final class SessionStore: @unchecked Sendable {
             onChange?()
         }
 
-        var s = sessions[message.sessionID] ?? AgentSession(
+        let key = AgentSession.storeKey(source: message.source, sessionID: message.sessionID)
+        var s = sessions[key] ?? AgentSession(
             sessionID: message.sessionID,
             source: message.source,
             lastUpdated: now
@@ -209,7 +229,8 @@ public final class SessionStore: @unchecked Sendable {
             if !s.gateWaiting {
                 s.attention = .working
             }
-            // Clear a resolved permission approval marker path.
+            // After timeout fail-open, gateWaiting is false but needs-you remains
+            // until the agent continues. A real approve/deny already cleared kind.
             if s.needsYouKind == .gate && !s.gateWaiting {
                 s.needsYouKind = nil
             }
@@ -226,6 +247,9 @@ public final class SessionStore: @unchecked Sendable {
             }
             s.detail = nil
             s.options = nil
+            s.activityTitle = nil
+            s.reason = nil
+            s.toolName = nil
         case .marker:
             applyMarker(kind: message.kind ?? .unknown, to: &s, message: message)
         case .gate:
@@ -255,9 +279,8 @@ public final class SessionStore: @unchecked Sendable {
             }
             if let title = message.title, !title.isEmpty {
                 s.activityTitle = title
-            }
-            if let status = message.status {
-                s.toolName = status
+            } else if let status = message.status, !status.isEmpty {
+                s.activityTitle = status
             }
         case .activityClear:
             s.activityTitle = nil
@@ -271,7 +294,7 @@ public final class SessionStore: @unchecked Sendable {
             }
         }
 
-        sessions[message.sessionID] = s
+        sessions[key] = s
         return s
     }
 
@@ -304,28 +327,31 @@ public final class SessionStore: @unchecked Sendable {
         }
     }
 
-    /// Mark gate resolved after Approve/Deny (session stays finished/working).
-    public func resolveGate(sessionID: String, now: Date = Date()) {
-        lock.lock()
-        defer {
-            lock.unlock()
-            onChange?()
+    /// Mark gate resolved after Approve/Deny (session stays working).
+    public func resolveGate(source: AgentSource? = nil, sessionID: String, now: Date = Date()) {
+        mutateSession(source: source, sessionID: sessionID, now: now) { s in
+            s.gateWaiting = false
+            s.needsYouKind = nil
+            s.attention = .working
         }
-        guard var s = sessions[sessionID] else { return }
-        s.gateWaiting = false
-        s.needsYouKind = nil
-        s.attention = .working
-        s.lastUpdated = now
-        sessions[sessionID] = s
     }
 
-    public func remove(sessionID: String) {
+    /// Timeout fail-open: drop the blocking waiter, keep needs-you visible.
+    public func releaseGateWaiter(source: AgentSource? = nil, sessionID: String, now: Date = Date()) {
+        mutateSession(source: source, sessionID: sessionID, now: now) { s in
+            s.gateWaiting = false
+        }
+    }
+
+    public func remove(source: AgentSource? = nil, sessionID: String) {
         lock.lock()
         defer {
             lock.unlock()
             onChange?()
         }
-        sessions.removeValue(forKey: sessionID)
+        if let key = storageKey(source: source, sessionID: sessionID) {
+            sessions.removeValue(forKey: key)
+        }
     }
 
     public func reset() {
@@ -333,5 +359,32 @@ public final class SessionStore: @unchecked Sendable {
         sessions.removeAll()
         lock.unlock()
         onChange?()
+    }
+
+    private func mutateSession(
+        source: AgentSource?,
+        sessionID: String,
+        now: Date,
+        _ body: (inout AgentSession) -> Void
+    ) {
+        lock.lock()
+        defer {
+            lock.unlock()
+            onChange?()
+        }
+        guard let key = storageKey(source: source, sessionID: sessionID), var s = sessions[key] else { return }
+        body(&s)
+        s.lastUpdated = now
+        sessions[key] = s
+    }
+
+    private func storageKey(source: AgentSource?, sessionID: String) -> String? {
+        if let source {
+            let key = AgentSession.storeKey(source: source, sessionID: sessionID)
+            return sessions[key] != nil ? key : nil
+        }
+        if sessions[sessionID] != nil { return sessionID }
+        let matches = sessions.filter { $0.value.sessionID == sessionID }
+        return matches.count == 1 ? matches.first?.key : nil
     }
 }
