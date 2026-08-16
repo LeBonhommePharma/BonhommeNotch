@@ -256,6 +256,47 @@ enum SocketSelfTest {
             check("large reply parseable JSON with command", false, String(largeReply.prefix(120)))
         }
 
+        // 13) Two concurrent blocking gates — server must not pin a thread per waiter.
+        let concA = #"{"v":1,"source":"claude","session_id":"sess-conc-a","action":"gate","tool_name":"Bash","detail":"a","tool_input":{"command":"echo a"}}"#
+        let concB = #"{"v":1,"source":"codex","session_id":"sess-conc-b","action":"gate","tool_name":"shell","detail":"b"}"#
+        let concABox = LockedBox<String?>(nil)
+        let concBBox = LockedBox<String?>(nil)
+        let concADone = DispatchSemaphore(value: 0)
+        let concBDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            concABox.value = sendAndWait(sock: sock, json: concA, timeout: 10)
+            concADone.signal()
+        }
+        DispatchQueue.global().async {
+            concBBox.value = sendAndWait(sock: sock, json: concB, timeout: 10)
+            concBDone.signal()
+        }
+        waited = 0
+        while (store.session(id: "sess-conc-a")?.gateWaiting != true
+                || store.session(id: "sess-conc-b")?.gateWaiting != true) && waited < 50 {
+            Thread.sleep(forTimeInterval: 0.05)
+            waited += 1
+        }
+        check("concurrent gates both waiting",
+              store.session(id: "sess-conc-a")?.gateWaiting == true
+                && store.session(id: "sess-conc-b")?.gateWaiting == true)
+        check("concurrent approve A", bridge.approve(sessionID: "sess-conc-a"))
+        check("concurrent deny B", bridge.deny(sessionID: "sess-conc-b"))
+        _ = concADone.wait(timeout: .now() + 5)
+        _ = concBDone.wait(timeout: .now() + 5)
+        if let data = concABox.value?.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            check("concurrent A allow", obj["behavior"] as? String == "allow", "\(obj)")
+        } else {
+            check("concurrent A reply", false, concABox.value ?? "nil")
+        }
+        if let data = concBBox.value?.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            check("concurrent B deny", obj["behavior"] as? String == "deny", "\(obj)")
+        } else {
+            check("concurrent B reply", false, concBBox.value ?? "nil")
+        }
+
         // 12) Fail-open timeout leaves needs-you (P0).
         bridge.defaultGateTimeout = 0.4
         let timeoutGate = """
