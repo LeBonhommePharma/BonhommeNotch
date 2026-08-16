@@ -34,8 +34,8 @@ public struct StatusSnapshot: Equatable, Sendable {
             sessionCount: ranked.count,
             needsYouCount: ranked.filter { $0.attention == .needsYou }.count,
             workingCount: ranked.filter { $0.attention == .working }.count,
-            primaryFocusLine: store.primaryFocusLine,
-            rankedSessionIDs: ranked.map(\.sessionID),
+            primaryFocusLine: store.focusLine(ranked: ranked),
+            rankedSessionIDs: ranked.map(\.id),
             rankedBadges: ranked.map { $0.attention.badge },
             updatedAt: now.timeIntervalSince1970
         )
@@ -54,7 +54,7 @@ public struct StatusSnapshot: Equatable, Sendable {
     }
 
     public func write(to path: String) throws {
-        let data = try JSONSerialization.data(withJSONObject: jsonObject(), options: [.prettyPrinted, .sortedKeys])
+        let data = try JSONSerialization.data(withJSONObject: jsonObject(), options: [.sortedKeys])
         try data.write(to: URL(fileURLWithPath: path), options: .atomic)
     }
 
