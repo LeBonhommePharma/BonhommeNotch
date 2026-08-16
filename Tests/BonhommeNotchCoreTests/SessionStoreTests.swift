@@ -87,7 +87,94 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(snap.needsYouCount, 1)
         XCTAssertEqual(snap.workingCount, 1)
         XCTAssertFalse(snap.primaryFocusLine.isEmpty)
-        XCTAssertEqual(snap.rankedSessionIDs.first, "a")
+        XCTAssertEqual(snap.rankedSessionIDs.first, "claude:a")
         XCTAssertEqual(snap.rankedBadges.first, "needs you")
+    }
+
+    func testCrossSourceSessionIDsDoNotCollide() throws {
+        let store = SessionStore()
+        store.apply(try HookProtocol.parse(
+            #"{"v":1,"source":"claude","session_id":"same","action":"start","cwd":"/claude"}"#
+        ))
+        store.apply(try HookProtocol.parse(
+            #"{"v":1,"source":"cursor","session_id":"same","action":"pending","command":"rm","cwd":"/cursor"}"#
+        ))
+        XCTAssertEqual(store.count, 2)
+        XCTAssertNil(store.session(id: "same"))
+        XCTAssertEqual(store.session(source: .claude, sessionID: "same")?.cwd, "/claude")
+        XCTAssertEqual(store.session(source: .cursor, sessionID: "same")?.attention, .needsYou)
+        XCTAssertEqual(store.session(id: "claude:same")?.source, .claude)
+        XCTAssertEqual(store.session(id: "cursor:same")?.source, .cursor)
+        let ranked = store.ranked()
+        XCTAssertEqual(ranked.first?.id, "cursor:same")
+        XCTAssertEqual(Set(ranked.map(\.id)), ["claude:same", "cursor:same"])
+    }
+
+    func testClearResetsStaleFields() throws {
+        let store = SessionStore()
+        store.apply(try HookProtocol.parse(
+            #"{"v":1,"source":"claude","session_id":"s","action":"gate","tool_name":"Bash","detail":"ls","reason":"network"}"#
+        ))
+        store.apply(try HookProtocol.parse(
+            #"{"v":1,"source":"claude","session_id":"s","action":"activity","title":"Working on ls"}"#
+        ))
+        store.apply(try HookProtocol.parse(
+            #"{"v":1,"source":"claude","session_id":"s","action":"clear"}"#
+        ))
+        let s = store.session(id: "s")
+        XCTAssertEqual(s?.attention, .working)
+        XCTAssertNil(s?.needsYouKind)
+        XCTAssertNil(s?.detail)
+        XCTAssertNil(s?.options)
+        XCTAssertNil(s?.activityTitle)
+        XCTAssertNil(s?.reason)
+        XCTAssertNil(s?.toolName)
+        XCTAssertFalse(s?.gateWaiting ?? true)
+    }
+
+    func testActivityDoesNotClobberToolName() throws {
+        let store = SessionStore()
+        store.apply(try HookProtocol.parse(
+            #"{"v":1,"source":"claude","session_id":"s","action":"busy","tool_name":"Bash","detail":"npm test"}"#
+        ))
+        XCTAssertEqual(store.session(id: "s")?.toolName, "Bash")
+        store.apply(try HookProtocol.parse(
+            #"{"v":1,"source":"claude","session_id":"s","action":"activity","status":"shell","title":"Running tests"}"#
+        ))
+        XCTAssertEqual(store.session(id: "s")?.toolName, "Bash")
+        XCTAssertEqual(store.session(id: "s")?.activityTitle, "Running tests")
+        store.apply(try HookProtocol.parse(
+            #"{"v":1,"source":"claude","session_id":"s","action":"activity","status":"running"}"#
+        ))
+        XCTAssertEqual(store.session(id: "s")?.toolName, "Bash")
+        XCTAssertEqual(store.session(id: "s")?.activityTitle, "running")
+    }
+
+    func testFocusLineClipsToEightyCharacters() throws {
+        let store = SessionStore()
+        let long = String(repeating: "x", count: 200)
+        let lineJSON = "{\"v\":1,\"source\":\"claude\",\"session_id\":\"clip\",\"action\":\"busy\",\"detail\":\"\(long)\",\"cwd\":\"/p\"}"
+        store.apply(try HookProtocol.parse(lineJSON))
+        let focus = store.session(id: "clip")!.focusLine
+        let clipped = focus.components(separatedBy: " · ").last!
+        XCTAssertEqual(clipped.count, 80)
+        XCTAssertTrue(clipped.hasSuffix("…"))
+    }
+
+    func testReleaseGateWaiterKeepsNeedsYou() throws {
+        let store = SessionStore()
+        store.apply(try HookProtocol.parse(
+            #"{"v":1,"source":"claude","session_id":"g","action":"gate","tool_name":"Bash","detail":"ls"}"#
+        ))
+        XCTAssertEqual(store.session(id: "g")?.attention, .needsYou)
+        XCTAssertEqual(store.session(id: "g")?.gateWaiting, true)
+        store.releaseGateWaiter(source: .claude, sessionID: "g")
+        let s = store.session(id: "g")
+        XCTAssertEqual(s?.attention, .needsYou)
+        XCTAssertEqual(s?.needsYouKind, .gate)
+        XCTAssertEqual(s?.gateWaiting, false)
+        store.resolveGate(source: .claude, sessionID: "g")
+        XCTAssertEqual(store.session(id: "g")?.attention, .working)
+        XCTAssertNil(store.session(id: "g")?.needsYouKind)
     }
 }

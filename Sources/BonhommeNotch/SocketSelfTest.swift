@@ -203,6 +203,84 @@ enum SocketSelfTest {
         check("batch first+second applied", batch?.attention == .needsYou && batch?.activityTitle == "Running: git push",
               batch.map { "\($0.attention.badge)/\($0.activityTitle ?? "")" } ?? "nil")
 
+        // 10) Cross-source session_id collision — two agents, same id, both kept.
+        sendFireAndForget(sock: sock, json: """
+        {"v":1,"source":"claude","session_id":"collide","action":"start","cwd":"/Users/demo/claude-side"}
+        """)
+        sendFireAndForget(sock: sock, json: """
+        {"v":1,"source":"cursor","session_id":"collide","action":"pending","command":"rm","cwd":"/Users/demo/cursor-side"}
+        """)
+        Thread.sleep(forTimeInterval: 0.1)
+        let collideClaude = store.session(source: .claude, sessionID: "collide")
+        let collideCursor = store.session(source: .cursor, sessionID: "collide")
+        check("cross-source both sessions exist", collideClaude != nil && collideCursor != nil)
+        check("cross-source claude cwd", collideClaude?.cwd?.hasSuffix("claude-side") == true, collideClaude?.cwd ?? "nil")
+        check("cross-source cursor needs-you", collideCursor?.attention == .needsYou, collideCursor.map { $0.attention.badge } ?? "nil")
+        check("cross-source raw id lookup is ambiguous", store.session(id: "collide") == nil)
+
+        // 11) Large updatedInput echo (exceeds PIPE_BUF) — sendAll must not truncate.
+        let blob = String(repeating: "A", count: 12_000)
+        let largeObj: [String: Any] = [
+            "v": 1,
+            "source": "claude",
+            "session_id": "sess-large",
+            "action": "gate",
+            "tool_name": "Bash",
+            "detail": "big write",
+            "tool_input": ["command": blob, "description": "here-doc"]
+        ]
+        let largeLine = String(data: try! JSONSerialization.data(withJSONObject: largeObj), encoding: .utf8)!
+        let largeBox = LockedBox<String?>(nil)
+        let largeDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            largeBox.value = sendAndWait(sock: sock, json: largeLine, timeout: 10)
+            largeDone.signal()
+        }
+        waited = 0
+        while store.session(id: "sess-large")?.gateWaiting != true && waited < 50 {
+            Thread.sleep(forTimeInterval: 0.05)
+            waited += 1
+        }
+        check("large gate waiting", store.session(id: "sess-large")?.gateWaiting == true)
+        check("large approve", bridge.approve(sessionID: "sess-large"))
+        _ = largeDone.wait(timeout: .now() + 5)
+        let largeReply = largeBox.value ?? ""
+        check("large reply non-empty", !largeReply.isEmpty, "len=\(largeReply.count)")
+        if let data = largeReply.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let updated = obj["updatedInput"] as? [String: Any],
+           let cmd = updated["command"] as? String {
+            check("large updatedInput length", cmd.count == 12_000, "count=\(cmd.count)")
+            check("large updatedInput intact", cmd == blob)
+        } else {
+            check("large reply parseable JSON with command", false, String(largeReply.prefix(120)))
+        }
+
+        // 12) Fail-open timeout leaves needs-you (P0).
+        bridge.defaultGateTimeout = 0.4
+        let timeoutGate = """
+        {"v":1,"source":"claude","session_id":"sess-timeout","action":"gate","tool_name":"Bash","detail":"needs a human","tool_input":{"command":"echo hi"}}
+        """
+        let timeoutBox = LockedBox<String?>(nil)
+        let timeoutDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            timeoutBox.value = sendAndWait(sock: sock, json: timeoutGate, timeout: 3)
+            timeoutDone.signal()
+        }
+        waited = 0
+        while store.session(id: "sess-timeout")?.gateWaiting != true && waited < 50 {
+            Thread.sleep(forTimeInterval: 0.05)
+            waited += 1
+        }
+        check("timeout gate registered", store.session(id: "sess-timeout")?.gateWaiting == true)
+        _ = timeoutDone.wait(timeout: .now() + 5)
+        let timeoutReply = timeoutBox.value ?? ""
+        let timeoutSess = store.session(source: .claude, sessionID: "sess-timeout")
+        check("timeout fail-open empty reply", timeoutReply.isEmpty, timeoutReply)
+        check("timeout still needs-you", timeoutSess?.attention == .needsYou, timeoutSess.map { $0.attention.badge } ?? "nil")
+        check("timeout waiter cleared", timeoutSess?.gateWaiting == false)
+        check("timeout kind still gate", timeoutSess?.needsYouKind == .gate)
+
         if failures == 0 {
             print("SOCKET SELFTEST OK")
             return 0
@@ -222,11 +300,7 @@ enum SocketSelfTest {
             var payload = line
             if !payload.hasSuffix("\n") { payload += "\n" }
             let data = payload.data(using: .utf8)!
-            let wrote = data.withUnsafeBytes { raw -> Int in
-                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
-                return write(fd, base, data.count)
-            }
-            if wrote < 0 { return false }
+            if !SocketIO.sendAll(fd: fd, data: data) { return false }
             if i + 1 < lines.count {
                 Thread.sleep(forTimeInterval: interLineSleep)
             }
@@ -240,11 +314,7 @@ enum SocketSelfTest {
         defer { if closeAfter { close(fd) } else { close(fd) } }
         guard connectUnix(fd: fd, path: sock) else { return false }
         let data = payload.data(using: .utf8)!
-        let wrote = data.withUnsafeBytes { raw -> Int in
-            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
-            return write(fd, base, data.count)
-        }
-        return wrote >= 0
+        return SocketIO.sendAll(fd: fd, data: data)
     }
 
     private static func connectUnix(fd: Int32, path: String) -> Bool {
@@ -276,24 +346,38 @@ enum SocketSelfTest {
         var payload = json
         if !payload.hasSuffix("\n") { payload += "\n" }
         let data = payload.data(using: .utf8)!
-        data.withUnsafeBytes { raw in
-            if let base = raw.bindMemory(to: UInt8.self).baseAddress {
-                _ = write(fd, base, data.count)
-            }
-        }
+        guard SocketIO.sendAll(fd: fd, data: data) else { return nil }
 
         if !waitForReply {
             return nil
         }
 
-        // Set receive timeout
-        var tv = timeval(tv_sec: Int(timeout), tv_usec: 0)
+        return readLine(fd: fd, timeout: timeout)
+    }
+
+    private static func readLine(fd: Int32, timeout: TimeInterval) -> String? {
+        let sec = Int(timeout)
+        let usec = Int((timeout - TimeInterval(sec)) * 1_000_000)
+        var tv = timeval(tv_sec: sec, tv_usec: Int32(max(0, usec)))
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
-        var buf = [UInt8](repeating: 0, count: 8192)
-        let n = read(fd, &buf, buf.count)
-        if n <= 0 { return nil }
-        return String(bytes: buf[0..<n], encoding: .utf8)?
+        var buffer = Data()
+        var tmp = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = read(fd, &tmp, tmp.count)
+            if n < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            if n == 0 { break }
+            buffer.append(tmp, count: n)
+            if let nl = buffer.firstIndex(of: 10) {
+                return String(data: buffer[..<nl], encoding: .utf8)
+            }
+            if buffer.count > 2_000_000 { break }
+        }
+        if buffer.isEmpty { return nil }
+        return String(data: buffer, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -68,7 +68,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = SessionStore()
     var bridge: SocketBridge!
     var statusItem: NSStatusItem?
-    var refreshTimer: Timer?
+    private var menuWork: DispatchWorkItem?
+    private var lastMenuSignature = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         bridge = SocketBridge(store: store)
@@ -80,21 +81,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         store.onChange = { [weak self] in
-            DispatchQueue.main.async { self?.refreshMenuBar() }
+            DispatchQueue.main.async { self?.scheduleMenuRefresh() }
         }
 
         setupMenuBar()
         refreshMenuBar()
         bridge.writeStatus()
-
-        // Periodic status rewrite for external observers.
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.bridge.writeStatus()
-            self?.refreshMenuBar()
-        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        menuWork?.cancel()
         bridge?.stop()
     }
 
@@ -108,6 +104,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshMenuBar()
     }
 
+    private func scheduleMenuRefresh() {
+        menuWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.refreshMenuBar()
+        }
+        menuWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
+    }
+
     private func refreshMenuBar() {
         let ranked = store.ranked()
         let title: String
@@ -118,10 +123,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             title = "BN·\(ranked.count)"
         }
+        let summary = store.statusSummary(ranked: ranked)
+        let signature = menuSignature(title: title, summary: summary, ranked: ranked)
+        if signature == lastMenuSignature { return }
+        lastMenuSignature = signature
+
         statusItem?.button?.title = title
 
         let menu = NSMenu()
-        menu.addItem(withTitle: store.statusSummary, action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: summary, action: nil, keyEquivalent: "")
         menu.addItem(.separator())
 
         if ranked.isEmpty {
@@ -130,7 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             for session in ranked.prefix(20) {
                 let line = session.focusLine
                 let item = NSMenuItem(title: line, action: nil, keyEquivalent: "")
-                item.representedObject = session.sessionID
+                item.representedObject = session.id
                 menu.addItem(item)
 
                 if session.attention == .needsYou && session.gateWaiting
@@ -141,7 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         keyEquivalent: ""
                     )
                     approve.target = self
-                    approve.representedObject = session.sessionID
+                    approve.representedObject = session.id
                     menu.addItem(approve)
 
                     let deny = NSMenuItem(
@@ -150,7 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         keyEquivalent: ""
                     )
                     deny.target = self
-                    deny.representedObject = session.sessionID
+                    deny.representedObject = session.id
                     menu.addItem(deny)
                 }
             }
@@ -165,6 +175,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         statusItem?.menu = menu
+    }
+
+    private func menuSignature(title: String, summary: String, ranked: [AgentSession]) -> String {
+        var parts = [title, summary]
+        for session in ranked.prefix(20) {
+            parts.append("\(session.id)|\(session.attention.rawValue)|\(session.gateWaiting)|\(session.focusLine)")
+        }
+        return parts.joined(separator: "\u{1e}")
     }
 
     @objc private func approveGate(_ sender: NSMenuItem) {
